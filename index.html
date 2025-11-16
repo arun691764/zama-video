@@ -1,0 +1,252 @@
+"""
+Jama (Zama) Web-Page → Text-Only YouTube Video Generator
+=========================================================
+
+Purpose:
+This GitHub-ready Python script fetches a public blog page (like the Zama blog URL you gave), extracts
+the page's text (headings and paragraphs), converts that text into a sequence of text slides (1920x1080),
+optionally generates or accepts a voiceover audio, and renders a final MP4 video using moviepy.
+
+Key features:
+- Fetches and parses the provided URL (requests + BeautifulSoup).
+- Cleans and extracts headings (h1..h3) and paragraph blocks, grouping them into readable "slide" text blocks.
+- Optionally generates TTS audio via gTTS (if --tts is set) or uses a provided audio file (--audio).
+- Renders text-only slides (no external images) with simple fade transitions and a watermark.
+- Produces a YouTube-ready MP4 (1920x1080, H.264 + AAC).
+
+Notes / Limitations:
+- gTTS requires network access to Google's TTS service (it may fail in restricted CI environments).
+- For long pages the script splits text into many slides; you may want to edit/curate the extracted text.
+- MoviePy requires ffmpeg installed on the machine where you run the script.
+
+Requirements:
+pip install moviepy beautifulsoup4 requests gTTS
+ffmpeg must be available on PATH.
+
+Usage examples:
+1) Use your own voiceover audio (recommended if you will record):
+   python jama_from_url_video_generator.py --url "https://www.zama.org/blog" --audio my_voice.mp3 --output jama_zama_video.mp4 --title "Zama Blog Overview"
+
+2) Let script generate TTS (English) and build video automatically:
+   python jama_from_url_video_generator.py --url "https://www.zama.org/blog" --tts --lang en --output jama_zama_tts.mp4
+
+3) Customize slide max words and theme:
+   python jama_from_url_video_generator.py --url URL --max-words 50 --bg-color "#0b1220" --text-color "#ffffff"
+
+"""
+
+import os
+import re
+import argparse
+import textwrap
+import tempfile
+import math
+import requests
+from bs4 import BeautifulSoup
+from moviepy.editor import (
+    TextClip,
+    CompositeVideoClip,
+    concatenate_videoclips,
+    AudioFileClip,
+)
+
+# Optional TTS
+try:
+    from gtts import gTTS
+    GTTS_AVAILABLE = True
+except Exception:
+    GTTS_AVAILABLE = False
+
+# -----------------------------
+# Utilities
+# -----------------------------
+
+def fetch_page_text(url):
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, 'html.parser')
+
+    # Remove scripts/styles
+    for s in soup(['script', 'style', 'noscript', 'svg']):
+        s.extract()
+
+    # Collect visible text: headings and paragraphs
+    blocks = []
+    for tag in soup.find_all(['h1','h2','h3','p','li']):
+        text = tag.get_text(separator=' ', strip=True)
+        if not text:
+            continue
+        # Ignore navigation-like links (very short)
+        if len(text) < 3:
+            continue
+        # Normalize whitespace
+        text = re.sub(r'\s+', ' ', text)
+        blocks.append(text)
+
+    # Basic dedup / cleanup: drop repeated navigation labels
+    cleaned = []
+    seen = set()
+    for b in blocks:
+        if b.lower() in seen:
+            continue
+        seen.add(b.lower())
+        cleaned.append(b)
+
+    return cleaned
+
+
+def group_into_slides(blocks, max_words=40):
+    """Group text blocks into slide-sized chunks (each <= max_words)."""
+    slides = []
+    buffer = []
+    buf_words = 0
+    for block in blocks:
+        words = block.split()
+        if buf_words + len(words) <= max_words:
+            buffer.append(block)
+            buf_words += len(words)
+        else:
+            if buffer:
+                slides.append(' '.join(buffer))
+            # If single block too long, split it
+            if len(words) > max_words:
+                for i in range(0, len(words), max_words):
+                    chunk = ' '.join(words[i:i+max_words])
+                    slides.append(chunk)
+                buffer = []
+                buf_words = 0
+            else:
+                buffer = [block]
+                buf_words = len(words)
+    if buffer:
+        slides.append(' '.join(buffer))
+    # Final cleanup: trim slides
+    slides = [s.strip() for s in slides if len(s.strip())>0]
+    return slides
+
+
+def make_text_clip(text, w=1920, h=1080, fontsize=56, duration=4, bg_color='#0b1220', text_color='#ffffff'):
+    # Wrap text for better layout
+    wrapped = '\n'.join(textwrap.wrap(text, width=40))
+    txt = TextClip(wrapped, fontsize=fontsize, font='Arial-Bold', method='caption', size=(w-200, None), align='center')
+    # Create a colored background by using on_color
+    txt = txt.set_duration(duration).on_color(size=(w, h), color=bg_color, col_opacity=1)
+    # Text color is set via TextClip default - if not correct, render as image overlaying color
+    return txt
+
+# -----------------------------
+# Main pipeline
+# -----------------------------
+
+def generate_from_url(url, output, audio_path=None, use_tts=False, tts_lang='en', max_words=45, title='JAMA Overview',
+                      title_duration=4, outro_duration=3, bg_color='#0b1220', text_color='#ffffff', fps=24):
+    # 1) Fetch page and extract text
+    print(f"Fetching and extracting: {url}")
+    blocks = fetch_page_text(url)
+    if not blocks:
+        raise RuntimeError('No textual content extracted from page.')
+    print(f"Extracted {len(blocks)} text blocks from page.")
+
+    # 2) Group into slides
+    slides = group_into_slides(blocks, max_words=max_words)
+    print(f"Created {len(slides)} slides (max_words={max_words}).")
+
+    # 3) TTS or use provided audio
+    temp_audio = None
+    if audio_path is None and use_tts:
+        if not GTTS_AVAILABLE:
+            raise RuntimeError('gTTS not available. Install gTTS or provide --audio')
+        full_text = '\n\n'.join(slides)
+        print('Generating TTS audio (gTTS)...')
+        tts = gTTS(full_text, lang=tts_lang)
+        temp_audio = os.path.join(tempfile.gettempdir(), 'jama_tts.mp3')
+        tts.save(temp_audio)
+        audio_path = temp_audio
+        print('TTS saved to', audio_path)
+
+    if audio_path is None:
+        # No audio -> estimate durations per slide (static duration)
+        print('No audio provided and TTS not selected: using fixed durations per slide.')
+        total_duration = title_duration + sum([4 for _ in slides]) + outro_duration
+        audio_duration = total_duration
+    else:
+        audio = AudioFileClip(audio_path)
+        audio_duration = audio.duration
+        print(f'Loaded audio: duration={audio_duration:.2f}s')
+
+    # 4) Distribute durations
+    # We'll give title_duration for title; outro_duration for outro; remaining audio duration divided across slides.
+    remaining = max(0.0, audio_duration - title_duration - outro_duration)
+    per_slide = remaining / max(1, len(slides))
+    # Avoid too short or too long per-slide durations
+    per_slide = max(2.0, min(per_slide, 10.0))
+    print(f'Per-slide duration = {per_slide:.2f}s')
+
+    # 5) Create clips
+    W, H = 1920, 1080
+    clips = []
+
+    # Title clip
+    title_clip = make_text_clip(title, W, H, fontsize=80, duration=title_duration, bg_color=bg_color, text_color=text_color)
+    clips.append(title_clip)
+
+    for idx, s in enumerate(slides, start=1):
+        txt_clip = make_text_clip(s, W, H, fontsize=56, duration=per_slide, bg_color=bg_color, text_color=text_color)
+        # optional small slide number
+        # overlay = TextClip(f"{idx}/{len(slides)}", fontsize=28, method='label').set_pos((W-140, H-60)).set_duration(per_slide)
+        comp = CompositeVideoClip([txt_clip])
+        clips.append(comp)
+
+    # Outro
+    outro_text = f"Thanks for watching - {title}" if title else "Thanks for watching"
+    outro_clip = make_text_clip(outro_text, W, H, fontsize=56, duration=outro_duration, bg_color=bg_color, text_color=text_color)
+    clips.append(outro_clip)
+
+    # 6) Concatenate with simple crossfade
+    final = concatenate_videoclips(clips, method='compose')
+
+    # 7) Attach audio if available
+    if audio_path is not None:
+        final = final.set_audio(AudioFileClip(audio_path))
+    # else final keeps silent audio.
+
+    # 8) Add watermark
+    watermark = TextClip('Atul 24x7', fontsize=28, method='label').set_pos(('right', 'top')).set_duration(final.duration)
+    final = CompositeVideoClip([final, watermark])
+
+    # 9) Export
+    print(f'Exporting final video to {output} ...')
+    final.write_videofile(output, fps=fps, codec='libx264', audio_codec='aac', threads=4, preset='medium')
+
+    # cleanup
+    if temp_audio and os.path.exists(temp_audio):
+        os.remove(temp_audio)
+    print('Done.')
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(description='Generate text-only video from a web page (slides + optional TTS or voiceover).')
+    p.add_argument('--url', required=True, help='Public URL to fetch (e.g. https://www.zama.org/blog)')
+    p.add_argument('--output', default='output.mp4', help='Output MP4 filename')
+    p.add_argument('--audio', default=None, help='Optional path to voiceover audio file (mp3/wav). If provided it will be used.')
+    p.add_argument('--tts', action='store_true', help='If set, generate TTS audio from the extracted text (requires gTTS).')
+    p.add_argument('--lang', default='en', help='TTS language (gTTS lang code), default en')
+    p.add_argument('--max-words', type=int, default=45, help='Max words per slide (default 45)')
+    p.add_argument('--title', default='Web Page Overview', help='Title card text')
+    p.add_argument('--title-duration', type=float, default=4.0, help='Seconds for title card')
+    p.add_argument('--outro-duration', type=float, default=3.0, help='Seconds for outro card')
+    p.add_argument('--bg-color', default='#0b1220', help='Background color for slides (hex)')
+    p.add_argument('--text-color', default='#ffffff', help='Text color for slides (hex)')
+    return p
+
+
+if __name__ == '__main__':
+    parser = build_parser()
+    args = parser.parse_args()
+    generate_from_url(args.url, args.output, audio_path=args.audio, use_tts=args.tts, tts_lang=args.lang,
+                      max_words=args.max_words, title=args.title, title_duration=args.title_duration,
+                      outro_duration=args.outro_duration, bg_color=args.bg_color, text_color=args.text_color)
